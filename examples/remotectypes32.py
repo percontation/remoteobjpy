@@ -1,3 +1,8 @@
+"""This is a module that allows using ctypes to import a 32-bit module
+from a 64-bit python interpreter. It does this by spawning a 32-bit python
+process, and proxies a ctypes module from that 32-bit python instance.
+(Note the unfortunate naming: "python32" and similar names in here refer
+to a 32-bit version of python 2.7, not python 3.2) """
 import remoteobj
 import socket
 

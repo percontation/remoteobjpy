@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-# remoteobj v0.4, best yet!
+# remoteobj v0.4.5, serving up some fresh IDA once again!
 # TODO: This will get wrecked by recursive sets/lists/dicts; need a more picklish method.
 # TODO: Dict/sets/lists should get unpacked to wrappers that are local for read-only access,
 #       but update the remote for write access. Note that __eq__ will be an interesting override.
@@ -33,13 +33,11 @@ class Proxy(object):
     object.__getattribute__(self, '_proxyconn').callattr(self, '__delattr__', (attr,), {})
   def __call__(self, *args, **kwargs):
     return object.__getattribute__(self, '_proxyconn').call(self, args, kwargs)
-  # GC crashes python -_-
-  """
+  # TODO: Does this GC still crash python in some cases?
   def __del__(self):
     if object.__getattribute__(self, '_proxyparent') is not None: return
     if not marshal or not struct or not socket: return # Reduce spurious messages when quitting python
     object.__getattribute__(self, '_proxyconn').delete(self)
-  """
 
   # hash and repr need to be handled specially, due to hash(type) != type.__hash__()
   # (and the same for repr). Incidentally, we'll cache the hash.
@@ -51,8 +49,17 @@ class Proxy(object):
   def __repr__(self):
     return object.__getattribute__(self, '_proxyconn').repr(self)
 
+  # Iter must return an iterator, so it gets special cased.
+  def __iter__(self):
+    return object.__getattribute__(self, '_proxyconn').iter(self)
+
+  # Truth-testing an object tries __nonzero__, then __len__, then True.
+  # Without special casing, a local truth test may raise a remote AttributeError.
+  def __nonzero__(self):
+    return object.__getattribute__(self, '_proxyconn').bool(self)
+
   # Special methods don't always go through __getattribute__, so redirect them all there.
-  for special in ('__str__', '__lt__', '__le__', '__eq__', '__ne__', '__gt__', '__ge__', '__cmp__', '__rcmp__', '__nonzero__', '__unicode__', '__len__', '__getitem__', '__setitem__', '__delitem__', '__iter__', '__reversed__', '__contains__', '__getslice__', '__setslice__', '__delslice__', '__add__', '__sub__', '__mul__', '__floordiv__', '__mod__', '__divmod__', '__pow__', '__lshift__', '__rshift__', '__and__', '__xor__', '__or__', '__div__', '__truediv__', '__radd__', '__rsub__', '__rmul__', '__rdiv__', '__rtruediv__', '__rfloordiv__', '__rmod__', '__rdivmod__', '__rpow__', '__rlshift__', '__rrshift__', '__rand__', '__rxor__', '__ror__', '__iadd__', '__isub__', '__imul__', '__idiv__', '__itruediv__', '__ifloordiv__', '__imod__', '__ipow__', '__ilshift__', '__irshift__', '__iand__', '__ixor__', '__ior__', '__neg__', '__pos__', '__abs__', '__invert__', '__complex__', '__int__', '__long__', '__float__', '__oct__', '__hex__', '__index__', '__coerce__', '__enter__', '__exit__'):
+  for special in ('__str__', '__lt__', '__le__', '__eq__', '__ne__', '__gt__', '__ge__', '__cmp__', '__rcmp__', '__unicode__', '__len__', '__getitem__', '__setitem__', '__delitem__', '__reversed__', '__contains__', '__getslice__', '__setslice__', '__delslice__', '__add__', '__sub__', '__mul__', '__floordiv__', '__mod__', '__divmod__', '__pow__', '__lshift__', '__rshift__', '__and__', '__xor__', '__or__', '__div__', '__truediv__', '__radd__', '__rsub__', '__rmul__', '__rdiv__', '__rtruediv__', '__rfloordiv__', '__rmod__', '__rdivmod__', '__rpow__', '__rlshift__', '__rrshift__', '__rand__', '__rxor__', '__ror__', '__iadd__', '__isub__', '__imul__', '__idiv__', '__itruediv__', '__ifloordiv__', '__imod__', '__ipow__', '__ilshift__', '__irshift__', '__iand__', '__ixor__', '__ior__', '__neg__', '__pos__', '__abs__', '__invert__', '__complex__', '__int__', '__long__', '__float__', '__oct__', '__hex__', '__index__', '__coerce__', '__enter__', '__exit__'):
     exec "def {special}(self, *args, **kwargs):\n\treturn object.__getattribute__(self, '_proxyconn').callattr(self, '{special}', args, kwargs)".format(special=special) in None, None
 
 class ProxyInfo(object):
@@ -98,38 +105,58 @@ class Connection(object):
     self.sock.sendall(struct.pack('<I', len(x)))
     self.sock.sendall(x)
 
+  def recvall(self, nbytes):
+    if nbytes < 512:
+      buf = self.sock.recv(nbytes, socket.MSG_WAITALL)
+      while len(buf) < nbytes:
+        t = self.sock.recv(nbytes - len(buf))
+        if len(t) == 0:
+          raise socket.error(errno.ECONNRESET, 'The socket was closed while receiving a message.')
+        buf += t
+    else:
+      buf = bytearray(nbytes)
+      view = memoryview(buf)
+      i = 0
+      while i < nbytes:
+        i += self.sock.recv_into(view[i:], nbytes-i, socket.MSG_WAITALL)
+        if i == 0:
+          raise socket.error(errno.ECONNRESET, 'The socket was closed while receiving a message.')
+      buf = memoryview(buf).tobytes()
+    return buf
+
   def recvmsg(self):
-    x = self.sock.recv(4)
-    if len(x) == 4:
-      y = struct.unpack('<I', x)[0]
-      z = self.sock.recv(y)
-      if len(z) == y:
-        return marshal.loads(z)
-    raise socket.error(errno.ECONNRESET, 'The socket was closed while receiving a message.')
+    x = struct.unpack('<I', self.recvall(4))[0]
+    return marshal.loads(self.recvall(x))
 
   # Note: must send after non-info_only packing, or objects will be left with +1 retain count in self.vended
-  def pack(self, val, info_only = False, isDictKey = False):
-    if type(val) in (bool, int, long, float, complex, str, unicode) or val is None or val is StopIteration or val is Ellipsis:
-      return val
-    elif type(val) == tuple:
-      return tuple(self.pack(i, info_only) for i in val)
-    elif type(val) == list:
-      return [self.pack(i, info_only) for i in val]
-    elif type(val) == set:
-      return {self.pack(i, info_only) for i in val}
-    elif type(val) == frozenset:
-      return frozenset(self.pack(i, info_only) for i in val)
-    elif type(val) == dict:
-      return {self.pack(k, info_only, isDictKey = True):self.pack(v, info_only) for k,v in val.iteritems()}
-    elif type(val) == Proxy:
-      return object.__getattribute__(val, '_proxyinfo').packed()
-    elif type(val) == CodeType:
-      return val
+  def pack(self, val, info_only = False, isDictKey = False, limit = None):
+    if limit is None:
+      limit = sys.getrecursionlimit() / 2
     else:
-      if not info_only:
-        self.vended.setdefault(id(val), [val, 0])[1] += 1
-      t = hash(val) if isDictKey else None
-      return ProxyInfo(self.endpoint, id(val), proxyhash=t).packed()
+      limit -= 1
+    
+    if limit > 1:
+      if type(val) in (bool, int, long, float, complex, str, unicode) or val is None or val is StopIteration or val is Ellipsis:
+        return val
+      elif type(val) == tuple:
+        return tuple(self.pack(i, info_only, limit=limit) for i in val)
+      elif type(val) == list:
+        return [self.pack(i, info_only, limit=limit) for i in val]
+      elif type(val) == set:
+        return {self.pack(i, info_only, limit=limit) for i in val}
+      elif type(val) == frozenset:
+        return frozenset(self.pack(i, info_only, limit=limit) for i in val)
+      elif type(val) == dict:
+        return {self.pack(k, info_only, isDictKey=True, limit=limit):self.pack(v, info_only, limit=limit) for k,v in val.iteritems()}
+      elif type(val) == Proxy:
+        return object.__getattribute__(val, '_proxyinfo').packed()
+      elif type(val) == CodeType:
+        return val
+    
+    if not info_only:
+      self.vended.setdefault(id(val), [val, 0])[1] += 1
+    t = hash(val) if isDictKey else None
+    return ProxyInfo(self.endpoint, id(val), proxyhash=t).packed()
 
   def unpack(self, val, info_only = False):
     if ProxyInfo.isPacked(val):
@@ -210,9 +237,10 @@ class Connection(object):
         return self.unpack(x[1])
       elif x[0] == 'exn':
         exntyp = exceptions.__dict__.get(x[1])
+        if exntyp is None: exntyp = globals().get(x[1])
         args = self.unpack(x[2])
         trace = x[3]
-        if exntyp and issubclass(exntyp, BaseException):
+        if exntyp is not None and issubclass(exntyp, BaseException):
           if DEBUG: print >> sys.stderr, 'Remote '+''.join(trace)
           raise exntyp(*args)
         else:
@@ -230,6 +258,8 @@ class Connection(object):
         'callattr' : self.handle_callattr,
         'hash' : self.handle_hash,
         'repr' : self.handle_repr,
+        'iter' : self.handle_iter,
+        'bool' : self.handle_bool,
         'gc' : self.handle_gc,
         'eval' : self.handle_eval,
         'exec' : self.handle_exec,
@@ -284,6 +314,17 @@ class Connection(object):
   def handle_repr(self, obj):
     return self.pack(repr(self.unpack(obj)))
 
+  # TODO: Think about a good way to handle this. Maybe use itertools to send like 10 items at a time?
+  def iter(self, proxy):
+    return iter(self.request(('iter', object.__getattribute__(proxy, '_proxyinfo').packed())))
+  def handle_iter(self, obj):
+    return self.pack(list(iter(self.unpack(obj))))
+
+  def bool(self, proxy):
+    return self.request(('bool', object.__getattribute__(proxy, '_proxyinfo').packed()))
+  def handle_bool(self, obj):
+    return self.pack(True) if self.unpack(obj) else self.pack(False)
+
   def delete(self, proxy):
     info = object.__getattribute__(proxy, '_proxyinfo')
     if info.attrpath != '': return
@@ -311,26 +352,35 @@ class Connection(object):
     self.garbage = []
     self.sock.close()
 
-  def _eval(self, expr, local = None):
-    ret, d = self.request(('eval', self.pack(expr), self.pack(local)))
-    if local is not None:
-      local.clear()
-      local.update(d)
-    return ret
-  def handle_eval(self, expr, local):
-    d = self.unpack(local)
-    ret = eval(self.unpack(expr), globals(), d)
-    return self.pack(ret), (self.pack(d) if d is not None else None)
+  def _eval(self, expr, vars = None):
+    return self.request(('eval', self.pack(expr), self.pack(vars)))
+  def handle_eval(self, expr, vars):
+    d = self.unpack(vars)
+    _globals = globals().copy()
+    if d is not None:
+      _globals.update(d)
+    ret = eval(self.unpack(expr), _globals)
+    return self.pack(ret)
 
-  def _exec(self, stmt, local = None):
-    d = self.request(('exec', self.pack(stmt), self.pack(local)))
-    if local is not None:
-      local.clear()
-      local.update(d)
-  def handle_exec(self, stmt, local):
-    d = self.unpack(local)
-    exec(self.unpack(stmt), globals(), d)
-    return self.pack(d) if d is not None else None
+  def _exec(self, stmt, vars = None):
+    d = self.request(('exec', self.pack(stmt), self.pack(vars)))
+    if vars is not None:
+      vars.clear()
+      vars.update(d)
+  def handle_exec(self, stmt, vars):
+    d = self.unpack(vars)
+    _globals = globals().copy()
+    if d is not None:
+      _globals.update(d)
+    _locals = {}
+    exec(self.unpack(stmt), _globals, _locals)
+    if d is None:
+      return self.pack({})
+    else:
+      for k in d:
+        if k not in _locals and k in _globals:
+          _locals[k] = _globals[k]
+      return self.pack(_locals)
 
   # Define a function on the remote side. Its __globals__ will be
   # the local client-side func.__globals__ filtered to the keys in
